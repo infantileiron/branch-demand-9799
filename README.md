@@ -6,7 +6,7 @@
 
 栖川售后每天由8位网点值班员汇总工单到达量，排班组在 `栖川_网点日结_20261114.xlsx` 中复制上周星期分布，再手工加减人数。痛点：漏日常被当零量、趋势调整没有回测、排班人数和依据版本难追溯。上游是售后工单日结；本项目替代连续性核对、预测比较与人数换算；下游是网点负责人核对技能、休息和班次后安排人员。
 
-四个模块：日量导入（逐条表单/API，含修订）、回测设置、预测对比、排班建议。三个核心实体为DailyVolume、ForecastRun、Staffing，分别贯穿数据库、模式、业务服务/控制、路由和前端；另有用户与审计。提交任务时冻结原始记录与参数，之后补录不改变旧预测。
+五个模块：日量导入（逐条表单/API，含修订）、工单变更流（事件接收、差异核对、日量发布）、回测设置、预测对比、排班建议。三个核心实体为DailyVolume、ForecastRun、Staffing，分别贯穿数据库、模式、业务服务/控制、路由和前端；工单变更流另有WorkOrderEvent、WorkOrder、WorkOrderConflict、VolumeConflict、DailyPublication与单例水位EventStreamState；另有用户与审计。提交任务时冻结原始记录与参数，之后补录不改变旧预测。
 
 |角色|可访问|典型动作|
 |---|---|---|
@@ -27,14 +27,35 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 ## 一天的操作剧本
 
-1. 08:50 viewer查看川北等8网点昨日工单日结。
-2. 09:00 analyst核对CSV上游记录，确认每个网点日期连续。
-3. 09:10 在日量导入补录川北2026-11-15、42单，说明“周末日结”；缺日必须补真实值，不能静默填0。
-4. 09:20 选择川北，回测14日，固定α=.6、β=.2，命名“11月下周网点需求”。
-5. 09:30 提交worker任务；刷新预测对比，检查两个模型的MAE/MAPE与回测曲线。
-6. 09:40 对比未来7日，选择与现场情况相符的模型；以每日单人12单生成排班参考。
-7. 10:00 analyst写明轮休/技能约束；10:10 admin核对并签核，不能重复签核。
-8. 10:20 viewer下载 `branch-demand-<id>.json`，作为下周排班会议的冻结证据。
+1. 08:50 viewer查看川北等8网点昨日工单日结与工单变更流水位。
+2. 09:00 analyst把上游工单变更逐条送入事件流：工单号、版本、受理日、归属网点、撤销标记；确认每网点日期连续。
+3. 09:05 核对“事件与现行日量差异”：转派会冲减原网点，撤销归零，迟到旧版不回退；同版异内容进入隔离区。差异未核对外发布会被阻止。
+4. 09:10 在日量导入补录/修订人工日结（如川北2026-11-15、42单）；缺日必须补真实值，不能静默填0。
+5. 09:15 发布已接收事件：日量、归属与发布号在单事务内生效。人工日量与事件覆盖冲突时保留人工值并列差异，核对后再发布。
+6. 09:20 选择川北，回测14日，固定α=.6、β=.2，命名“11月下周网点需求”。预测只取发布后已生效日量。
+7. 09:30 提交worker任务；刷新预测对比，检查两个模型的MAE/MAPE与回测曲线。
+8. 09:40 对比未来7日，选择与现场情况相符的模型；以每日单人12单生成排班参考。
+9. 10:00 analyst写明轮休/技能约束；10:10 admin核对并签核，不能重复签核。
+10. 10:20 viewer下载 `branch-demand-<id>.json`，作为下周排班会议的冻结证据。
+
+## 工单变更流与日量发布
+
+工单变更事件包含工单号、版本、受理日、归属网点和撤销标记。接收后按工单号聚合，**每单只取已采用事件中的最高版本**重建日量：
+
+- 转派：新版本归属新网点，旧网点该受理日计数减一；减到0时原网点显式写0，不删行。
+- 撤销：最高版本 `cancelled=true` 时不计数，该网点日期归零。
+- 乱序/迟到旧版：仍记录在事件日志，但不参与重建，归属缓存保持最高版本，不回退。
+- 重复投递：`delivery_id` 或“同工单+同版本+同内容”判重，只返回 duplicate，水位不变。
+- 同版异内容：新内容放入隔离区 `work_order_conflicts`，原归属不动，发布被阻止；人工选择采用新内容或保留原内容后才可发布。若该工单已有更高版本生效，该差异只保留待查，不阻塞。
+- 全量重跑：每次发布都按事件日志从头重建并覆盖事件来源日量，重复执行结果一致。
+
+三阶段都与“处理中→生效”一致：`POST /events` 在一个事务内写事件并更新 `work_orders` 归属缓存；`POST /stream/publish` 在事件水位行锁内取快照、重建、写 `daily_volumes` 并记 `daily_publications`，任一步失败整体回退，不留半成品。发布并发接收新事件时，新事件落在下一个发布水位之后，不丢不重。
+
+人工日量（`source=manual`）与事件覆盖同网点日期冲突时，发布返回409并列出差异；`GET /stream/differences` 可查差异。`POST /conflicts/volumes/{branch}/{day}/resolve` 选择 `adopt_event` 或 `keep_manual`：采用事件则下次发布覆盖为事件值；保留人工则后续发布跳过该日期。核对结论绑定当时的两个数值，任一再次变化即失效并要求重核。工单差异用 `GET /conflicts` 查看、`POST /conflicts/work-orders/{id}/resolve` 处理。
+
+预测提交时冻结的是当时 `daily_volumes` 中的已生效日量（未发布事件不在内），并记录 `snapshot_meta.published_seq`；之后补录、转派、撤销或重跑发布都不改旧预测的 `result.snapshot`，历史版本保留原依据。
+
+页面“工单变更流”一页可送事件（含撤销勾选）、查差异、核对工单/日量差异并发布；发布按钮与页面刷新会重新拉取水位，因此可以在发布期间继续送事件。
 
 ## 核心算法与边界
 
@@ -58,12 +79,12 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 恰好五服务：backend等待db/redis健康，worker还等待backend，frontend等待backend。所有服务有healthcheck；worker每轮更新`/tmp/heartbeat`，Redis队列处理真实预测并在`/artifacts`共享卷写JSON。数据库、Redis、结果各有命名卷。Nginx `/api/`转发后端根路由；worker启动恢复queued/running任务。清理：`docker compose down -v --remove-orphans`。
 
-环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。显式10.253.109.0/24用于规避当前机默认网络池耗尽，移机可调整。演示凭据/JWT密钥部署时替换。本地开发可先起db/redis，在backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，再`uvicorn src.main:app --reload`；前端沿用Nginx或同源代理。ORM建初表，migrations保留DDL，无在线版本迁移器。
+环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。显式10.253.109.0/24用于规避当前机默认网络池耗尽，移机可调整。演示凭据/JWT密钥部署时替换。本地开发可先起db/redis，在backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，再`uvicorn src.main:app --reload`；前端沿用Nginx或同源代理。ORM建初表，`src/config/schema.py`会为旧库补齐新增列，migrations保留DDL，无在线版本迁移器。
 
-共享枚举：ROLES、STATES、BRANCHES、MODELS，后端src/constants/enums.py和schemas/business.py，前端src/constants/enums.js；存储列见models/entities.py。所有计算和人数换算在后端，前端只展示。
+共享枚举：ROLES、STATES、BRANCHES、MODELS，后端src/constants/enums.py和schemas/business.py，前端src/constants/enums.js；存储列见models/entities.py。所有计算和人数换算在后端，前端只展示。事件流接口：`POST /events`（批量≤500，`delivery_id`可选）、`GET /events`、`GET /stream`、`GET /stream/differences`、`POST /stream/publish`、`GET /publications`、`GET /conflicts`、`POST /conflicts/work-orders/{id}/resolve`、`POST /conflicts/volumes/{branch}/{day}/resolve`。
 
 ## 范围与证据
 
-小型演示为逐条录入/修订，无CSV批量上传、删除、分页、自动超参搜索或外部排班发布。无置信区间或节假日外生变量；单worker，不宣称多worker exactly-once。时间序列按业务日，不涉及小时时区换算。字体依赖Google Fonts，断网回退serif/sans-serif。
+小型演示为逐条录入/修订，无CSV批量上传、删除、分页、自动超参搜索或外部排班发布。无置信区间或节假日外生变量；单worker，不宣称多worker exactly-once。时间序列按业务日，不涉及小时时区换算。工单事件为HTTP批量推送（每批≤500条），无消息中间件或回放订阅；隔离区与日量差异需人工核对，不做自动裁决。字体依赖Google Fonts，断网回退serif/sans-serif。
 
-真实测试、截图和已知差异放在 `../../test-artifacts/gb-3109/`，源码不放证据。测试包含算法已知值、零MAPE、缺日拒绝、无未来泄漏、种子幂等、三角色与浏览器完整流程。许可证MIT，见LICENSE。
+后端测试：`cd backend && pip install -r requirements-dev.txt && pytest tests -q`；并发用例需 PostgreSQL，SQLite 下自动跳过。真实测试、截图和已知差异放在 `../../test-artifacts/gb-3109/`，源码不放证据。测试包含算法已知值、零MAPE、缺日拒绝、无未来泄漏、种子幂等、三角色与浏览器完整流程；`backend/tests/test_events.py` 另覆盖乱序转派、撤销重放、重复投递、同版异内容隔离、人工/事件冲突阻止、发布失败回退与预测快照冻结。许可证MIT，见LICENSE。

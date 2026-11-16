@@ -1,1 +1,1 @@
-export const state={user:null,volumes:[],runs:[],staffings:[],selected:null};
+export const state={user:null,volumes:[],runs:[],staffings:[],stream:null,selected:null};
